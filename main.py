@@ -1,4 +1,6 @@
-from scapy.all import sniff, IP, TCP, Raw, ARP, ICMP
+import math
+
+from scapy.all import sniff, IP, TCP, Raw, ARP, ICMP, UDP, DNS, DNSQR
 import sqlite3, requests, threading, time, re
 from queue import Queue
 import urllib.parse
@@ -10,14 +12,26 @@ attackers = {}
 syn_track = {}
 arp_table = {}
 icmp_track={}
+ssh_track={}
 bruteforce_track={}
 exfil_track={}
-
+contor_pachete_curatare=0
 LIMITA_SYN = 50
 
 conexiune = sqlite3.connect("alerte.db", check_same_thread=False)
 cursor = conexiune.cursor()
 cursor.execute("CREATE TABLE IF NOT EXISTS istoric (ip TEXT, mesaj TEXT)")
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS captura_retea (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        sursa TEXT,
+        destinatie TEXT,
+        protocol TEXT,
+        lungime INTEGER,
+        info TEXT
+    )
+''')
 cursor.execute("DELETE FROM istoric")
 conexiune.commit()
 print("[DB] Database successfully reset for the new session.")
@@ -32,6 +46,60 @@ def clean_payload(payload_brut):
     payload = re.sub(r'\s+', ' ', payload)
 
     return payload.strip().lower()
+
+def incarca_whitelist_dns():
+    try:
+        with open("whitelist_dns.txt","r") as f:
+            return  [linie.strip() for linie in f.readlines() if linie.strip()]
+    except FileNotFoundError:
+        print("Fisierul whitelist_dns.txt nu a fost gasit.")
+        return []
+
+WHITELIST_DNS=incarca_whitelist_dns()
+
+def log_traffic(pachet):
+    if pachet.haslayer(IP):
+        sursa=pachet[IP].src
+        destinatie=pachet[IP].dst
+        lungime=len(pachet)
+
+        protocol = "IP" #fallback
+
+        for strat in pachet.layers():
+            nume_strat = strat.__name__
+            if nume_strat not in ['Ethernet', '802.3', 'IP', 'IPv6', 'Raw', 'Padding']:
+                protocol = nume_strat
+
+        if pachet.haslayer(Raw):
+            date_brute=bytes(pachet[Raw].load)
+            info=date_brute.hex()
+        else:
+            info="NO_PAYLOAD: "+pachet[IP].payload.summary()
+
+        if len(info) > 2000:
+            info = info[:2000]
+
+        try:
+            cursor.execute('''
+                INSERT INTO captura_retea (sursa, destinatie, protocol, lungime, info)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (sursa, destinatie, protocol, lungime, info))
+            conexiune.commit()
+
+            global contor_pachete_curatare
+            contor_pachete_curatare+=1
+
+            if contor_pachete_curatare>=1000:
+                cursor.execute('''
+                                    DELETE FROM captura_retea 
+                                    WHERE id NOT IN (
+                                        SELECT id FROM captura_retea ORDER BY id DESC LIMIT 50000
+                                    )
+                                ''')
+                conexiune.commit()
+                contor_pachete_curatare=0
+        except Exception as e:
+            print(f"Eroare scriere DB Wireshark: {e}")
 
 def verify_rep(ip_atac):
     url = "https://api.abuseipdb.com/api/v2/check"
@@ -49,6 +117,15 @@ def verify_rep(ip_atac):
             print(f"[THREAT INTEL] IP {ip_atac} has a risk score of: {scor}%")
     except:
         pass
+
+def calculate_entropy(string):
+    if not string:
+        return 0
+    prob = [float(string.count(c)) / len(string) for c in dict.fromkeys(list(string))]
+    entropy = -sum([p * math.log(p) / math.log(2.0) for p in prob])
+    return entropy
+
+######################                 DETECT FUNCTIONS
 
 def detect_portscan(ip, port):
     if ip not in attackers:
@@ -111,7 +188,6 @@ def detect_bruteforce(payload, ip_sursa):
                 bruteforce_track[ip_sursa] = {"count": 0, "primul": timp_curent}
         else:
             bruteforce_track[ip_sursa] = {"count": 1, "primul": timp_curent}
-
 
 def detect_exfiltration(pachet):
     if pachet.haslayer(IP):
@@ -227,10 +303,73 @@ def detect_arp_spoof(pachet):
         else:
             arp_table[ipsrc] = macsrc
 
+def detect_dns_tunneling(pachet):
+    if pachet.haslayer(IP) and pachet.haslayer(DNSQR) and pachet.haslayer(DNS):
+        ipsrc=pachet[IP].src
+        try:
+            nume=pachet[DNSQR].qname.decode('utf-8',errors='ignore').strip('.')
+            tip=pachet[DNSQR].qtype
+
+            safe = any(nume.endswith(dom_safe) for dom_safe in WHITELIST_DNS)
+            if safe: return
+
+            parti=nume.split('.')
+            if len(parti)>2:
+                subdomeniu="".join(parti[:-2])
+                entropie=calculate_entropy(subdomeniu)
+
+                suspect=False
+                motiv=""
+
+                if entropie>4.2 and len(subdomeniu)>15:
+                    suspect=True
+                    motiv = f"High Entropy ({entropie:.2f})"
+                elif len(subdomeniu)>50 and entropie > 3.0:
+                    suspect=True
+                    motiv = f"Oversized & Suspicious ({entropie:.2f})"
+                elif tip==16 and entropie>3.5:
+                    suspect=True
+                    motiv="Suspicious TXT Query"
+
+                if suspect:
+                    print(f"[THREAT] Advanced DNS Tunneling de la {ipsrc}. Motiv: {motiv}. Dom: {nume}")
+                    cursor.execute("INSERT INTO istoric (ip, mesaj) VALUES (?, ?)",
+                                   (ipsrc, f"DNS Data Leak ({motiv})"))
+                    conexiune.commit()
+        except Exception as e:
+            pass
+
+def detect_ssh_bruteforce(pachet):
+    if pachet.haslayer(TCP) and pachet.haslayer(IP) and pachet[TCP].dport == 22 and pachet[TCP].flags == 'S':
+        ip_sursa = pachet[IP].src
+        timp_curent = time.time()
+
+        if ip_sursa not in ssh_track:
+            ssh_track[ip_sursa] = {"count": 1, "primul": timp_curent}
+        else:
+            ssh_track[ip_sursa]["count"] += 1
+
+        timp_scurs = timp_curent - ssh_track[ip_sursa]["primul"]
+
+        if timp_scurs <= 10.0:
+            if ssh_track[ip_sursa]["count"] >= 5:
+                print(f"[THREAT] SSH Brute-Force detected from {ip_sursa}!")
+                cursor.execute("INSERT INTO istoric (ip, mesaj) VALUES (?, ?)", (ip_sursa, "SSH Brute-Force (Port 22)"))
+                conexiune.commit()
+                ssh_track[ip_sursa] = {"count": 0, "primul": timp_curent}
+        else:
+            ssh_track[ip_sursa] = {"count": 1, "primul": timp_curent}
+
+########################################################
+
 def process_packet(pachet):
+    log_traffic(pachet)
+
     detect_arp_spoof(pachet)
     detect_icmp_flood(pachet)
     detect_exfiltration(pachet)
+    detect_dns_tunneling(pachet)
+    detect_ssh_bruteforce(pachet)
 
     if pachet.haslayer(IP) and pachet.haslayer(TCP):
         ip_sursa = pachet[IP].src
@@ -253,7 +392,7 @@ print("Analysis engine started in the background.")
 
 def start_sniffer():
     print("Sniffer is active and scanning traffic...")
-    sniff(iface="Software Loopback Interface 1", filter="tcp or arp or icmp", prn=lambda x: packet_queue.put(x), store=0)
+    sniff(iface="Software Loopback Interface 1", filter="tcp or arp or icmp or udp", prn=lambda x: packet_queue.put(x), store=0)
 
 thread_sniffer = threading.Thread(target=start_sniffer, daemon=True)
 thread_sniffer.start()

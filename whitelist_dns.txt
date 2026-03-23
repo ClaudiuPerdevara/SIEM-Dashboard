@@ -1,0 +1,5 @@
+amazonaws.com
+google.com
+microsoft.com
+facebook.com
+cloudfront.net
